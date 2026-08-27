@@ -1,0 +1,41 @@
+- name: Obtain certificate for {{ domain_name }}
+  hosts: "{{ target_hosts | mandatory }}"
+  become: true
+  vars:
+    domain_name: "{{ domain_name | mandatory }}"
+    regru_username: "{{ regru_username | mandatory }}"
+    regru_password: "{{ regru_password | mandatory }}"
+
+  tasks:
+    - block:
+        - name: Create temporary directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: certbot-regru-
+          register: certbot_tempdir
+
+        - name: Copy regru.ini
+          ansible.builtin.template:
+            src: regru.ini
+            dest: "{{ certbot_tempdir.path }}/regru.ini"
+            mode: '0600'
+
+        - name: Obtain certificate
+          ansible.builtin.shell: |
+            docker run --rm \
+              -v "{{ certbot_tempdir.path }}/regru.ini:/etc/letsencrypt/regru.ini:ro" \
+              -v /etc/letsencrypt:/etc/letsencrypt \
+              -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+              lionur/certbot-dns-regru@sha256:a7e9dde4ed15558d2ea6d4f07566781a62b7c7363b0fa1b2fcfdd448fb5c3936 \
+              certonly --non-interactive --keep-until-expiring -a certbot-regru:dns -d {{ domain_name }} -d *.{{ domain_name }} --register-unsafely-without-email --agree-tos --certbot-regru:dns-propagation-seconds 600
+      always:
+        - name: Delete temporary directory
+          ansible.builtin.file:
+            path: "{{ certbot_tempdir.path }}"
+            state: absent
+          when: certbot_tempdir is defined and certbot_tempdir.path is defined
+
+        - name: Delete regru.ini
+          ansible.builtin.file:
+            path: /etc/letsencrypt/regru.ini
+            state: absent

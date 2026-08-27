@@ -1,0 +1,117 @@
+- name: Archive a folder as ZIP and upload it to S3
+  hosts: "{{ target_hosts | mandatory }}"
+  gather_facts: false
+
+  vars:
+    backup_directory: "{{ backup_directory | mandatory }}"
+    backup_name: "{{ backup_name | mandatory }}"
+    upload_latest_copy: "{{ upload_latest_copy | mandatory | bool | string | lower }}"
+    upload_timestamped_copy: "{{ upload_timestamped_copy | mandatory | bool | string | lower }}"
+    mirror_copy: "{{ mirror_copy | mandatory | bool | string | lower }}"
+
+    s3_type: "{{ s3_type | mandatory }}"
+    s3_provider: "{{ s3_provider | mandatory }}"
+    s3_endpoint: "{{ s3_endpoint | mandatory }}"
+    s3_region: "{{ s3_region | mandatory }}"
+    s3_bucket: "{{ s3_bucket | mandatory }}"
+    s3_prefix: "folder"
+    s3_force_path_style: "{{ s3_force_path_style | mandatory }}"
+    s3_access_key: "{{ s3_access_key | mandatory }}"
+    s3_secret_key: "{{ s3_secret_key | mandatory }}"
+
+  tasks:
+    - name: Verify backup directory exists
+      ansible.builtin.stat:
+        path: "{{ backup_directory }}"
+      register: backup_directory_stat
+
+    - name: Fail when backup directory does not exist
+      ansible.builtin.fail:
+        msg: "Backup directory '{{ backup_directory }}' does not exist or is not a directory."
+      when: not backup_directory_stat.stat.exists or not backup_directory_stat.stat.isdir
+
+    - name: Verify at least one backup mode is enabled
+      ansible.builtin.assert:
+        that:
+          - upload_latest_copy == "true" or upload_timestamped_copy == "true" or mirror_copy == "true"
+        fail_msg: "At least one backup mode must be enabled."
+
+    - name: Generate ISO datetime
+      ansible.builtin.command: date -u +%Y-%m-%dT%H-%M-00Z
+      changed_when: false
+      register: timestamp_output
+
+    - name: Set timestamp fact
+      ansible.builtin.set_fact:
+        timestamp: "{{ timestamp_output.stdout }}"
+
+    - name: Upload ZIP backups
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        temp_directory="$(mktemp -d /tmp/folder-backup.XXXXXX)"
+        archive_path="$temp_directory/backup.zip"
+        trap 'rm -f "$archive_path"; rmdir "$temp_directory"' EXIT
+
+        source_parent="$(dirname {{ backup_directory | quote }})"
+        source_name="$(basename {{ backup_directory | quote }})"
+        (
+          cd "$source_parent"
+          zip -r -q "$archive_path" "$source_name"
+        )
+
+        if [ "{{ upload_latest_copy }}" = "true" ]; then
+          rclone copyto "$archive_path" "s3:{{ s3_bucket }}/{{ s3_prefix | regex_replace('/+$', '') }}/{{ backup_name }}/backup.zip"
+        fi
+
+        if [ "{{ upload_timestamped_copy }}" = "true" ]; then
+          rclone copyto "$archive_path" "s3:{{ s3_bucket }}/{{ s3_prefix | regex_replace('/+$', '') }}/{{ backup_name }}/backup-{{ timestamp }}.zip"
+        fi
+      args:
+        executable: /bin/bash
+      environment:
+        RCLONE_CONFIG_S3_TYPE: "{{ s3_type }}"
+        RCLONE_CONFIG_S3_PROVIDER: "{{ s3_provider }}"
+        RCLONE_CONFIG_S3_ENDPOINT: "{{ s3_endpoint }}"
+        RCLONE_CONFIG_S3_REGION: "{{ s3_region }}"
+        RCLONE_CONFIG_S3_ACCESS_KEY_ID: "{{ s3_access_key }}"
+        RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+        RCLONE_CONFIG_S3_FORCE_PATH_STYLE: "{{ s3_force_path_style }}"
+        RCLONE_CONFIG_S3_V2_AUTH: "false"
+      register: zip_backup_result
+      retries: 3
+      delay: 10
+      until: zip_backup_result.rc == 0
+      when: upload_latest_copy == "true" or upload_timestamped_copy == "true"
+#      no_log: true
+
+    - name: Mirror folder to S3
+      ansible.builtin.command:
+        argv:
+          - rclone
+          - sync
+          - "{{ backup_directory }}"
+          - "s3:{{ s3_bucket }}/{{ s3_prefix | regex_replace('/+$', '') }}/{{ backup_name }}/mirror"
+      environment:
+        RCLONE_CONFIG_S3_TYPE: "{{ s3_type }}"
+        RCLONE_CONFIG_S3_PROVIDER: "{{ s3_provider }}"
+        RCLONE_CONFIG_S3_ENDPOINT: "{{ s3_endpoint }}"
+        RCLONE_CONFIG_S3_REGION: "{{ s3_region }}"
+        RCLONE_CONFIG_S3_ACCESS_KEY_ID: "{{ s3_access_key }}"
+        RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+        RCLONE_CONFIG_S3_FORCE_PATH_STYLE: "{{ s3_force_path_style }}"
+        RCLONE_CONFIG_S3_V2_AUTH: "false"
+      register: mirror_result
+      retries: 3
+      delay: 10
+      until: mirror_result.rc == 0
+      when: mirror_copy == "true"
+#      no_log: true
+
+    - name: Show success message
+      ansible.builtin.debug:
+        msg: >-
+          Folder '{{ backup_directory }}' backup completed.
+          {{ (upload_latest_copy == 'true') | ternary('The latest copy was uploaded as backup.zip.', '') }}
+          {{ (upload_timestamped_copy == 'true') | ternary('A timestamped copy was also uploaded as backup-' ~ timestamp ~ '.zip.', '') }}
+          {{ (mirror_copy == 'true') | ternary('The folder was also mirrored to the mirror/ prefix.', '') }}

@@ -1,0 +1,83 @@
+- name: Stream pg_dump from PostgreSQL container to MinIO (compressed, timestamped file)
+  hosts: localhost
+  gather_facts: yes
+
+  vars:
+    database_name: "{{ database_name | mandatory }}"
+    pg_container_name: "postgres"
+    pg_user: "postgres"
+    pg_password: ""
+
+    s3_type: "{{ s3_type | mandatory }}"
+    s3_provider: "{{ s3_provider | mandatory }}"
+    s3_endpoint: "{{ s3_endpoint | mandatory }}"
+    s3_region: "{{ s3_region | mandatory }}"
+    s3_bucket: "{{ s3_bucket | mandatory }}"
+    s3_prefix: "postgres"
+    s3_force_path_style: "{{ s3_force_path_style | mandatory }}"
+    s3_access_key: "{{ s3_access_key | mandatory }}"
+    s3_secret_key: "{{ s3_secret_key | mandatory }}"
+
+  tasks:
+    - name: Verify PostgreSQL container is running
+      command: docker ps --filter "name={{ pg_container_name }}" --filter "status=running" --format "{{ '{{.Names}}' }}"
+      changed_when: false
+      register: container_check
+
+    - name: Fail if PostgreSQL container is not running
+      fail:
+        msg: "Container '{{ pg_container_name }}' is not running."
+      when: container_check.stdout != pg_container_name
+
+    - name: Generate ISO datetime
+      command: date -u +%Y-%m-%dT%H:%M:00
+      changed_when: false
+      register: timestamp_output
+
+    - name: Set timestamp fact
+      set_fact:
+        timestamp: "{{ timestamp_output.stdout }}"
+
+    - name: Build pg_dump command
+      set_fact:
+        pg_dump_cmd: >-
+          docker exec --env PGPASSWORD {{ pg_container_name | quote }}
+          pg_dump
+          --username={{ pg_user }}
+          --dbname={{ database_name }}
+          --no-password
+          --clean
+          --if-exists
+
+    - name: Build full backup pipeline
+      set_fact:
+        backup_pipeline: >-
+          {{ pg_dump_cmd }} | gzip --fast |
+          rclone rcat s3:{{ s3_bucket }}/{{ s3_prefix | regex_replace('/+$', '') }}/{{ database_name }}/{{ timestamp }}.psql.gz
+
+    - name: Dump database from container and stream to MinIO
+      shell: |
+        set -o pipefail
+        {{ backup_pipeline }}
+      args:
+        executable: /bin/bash
+      environment:
+        PGPASSWORD: "{{ pg_password }}"
+        RCLONE_CONFIG_S3_TYPE: "{{ s3_type }}"
+        RCLONE_CONFIG_S3_PROVIDER: "{{ s3_provider }}"
+        RCLONE_CONFIG_S3_ENDPOINT: "{{ s3_endpoint }}"
+        RCLONE_CONFIG_S3_REGION: "{{ s3_region }}"
+        RCLONE_CONFIG_S3_ACCESS_KEY_ID: "{{ s3_access_key }}"
+        RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: "{{ s3_secret_key }}"
+        RCLONE_CONFIG_S3_FORCE_PATH_STYLE: "{{ s3_force_path_style }}"
+        RCLONE_CONFIG_S3_V2_AUTH: "false"
+      register: backup_result
+      retries: 3
+      delay: 10
+      until: backup_result.rc == 0
+      no_log: true
+
+    - name: Show success message
+      debug:
+        msg: "Database '{{ database_name }}' (compressed) streamed to s3://{{ s3_bucket }}/{{ s3_prefix | regex_replace('/+$', '') }}/{{ database_name }}/{{ timestamp }}.psql.gz at ({{ s3_endpoint }})"
+      when: backup_result.rc == 0
