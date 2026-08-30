@@ -1,0 +1,124 @@
+- name: Back up a directory incrementally with Restic
+  hosts: "{{ target_hosts | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    backup_directory: "{{ backup_directory | mandatory }}"
+    backup_name: "{{ backup_name | mandatory }}"
+    exclude_file: >-
+      {{ restic_exclude_file
+         | default(backup_directory ~ '/.restic-excludes') }}
+
+    s3_endpoint: "{{ s3_endpoint | mandatory }}"
+    s3_bucket: "{{ s3_bucket | mandatory }}"
+    s3_prefix: restic
+    s3_force_path_style: "{{ s3_force_path_style | mandatory }}"
+    s3_repository_path: >-
+      {{ s3_prefix | regex_replace('^/+|/+$', '') }}/{{ backup_name }}
+
+    restic_binary: restic
+    restic_environment:
+      RESTIC_REPOSITORY: >-
+        s3:{{ s3_endpoint | regex_replace('/+$', '') }}/{{ s3_bucket }}/{{ s3_repository_path }}
+      RESTIC_PASSWORD: insecure
+      AWS_ACCESS_KEY_ID: "{{ s3_access_key | mandatory }}"
+      AWS_SECRET_ACCESS_KEY: "{{ s3_secret_key | mandatory }}"
+      AWS_DEFAULT_REGION: "{{ s3_region | mandatory }}"
+
+  tasks:
+    - name: Verify backup directory exists
+      ansible.builtin.stat:
+        path: "{{ backup_directory }}"
+      register: backup_directory_stat
+
+    - name: Fail when backup directory does not exist
+      ansible.builtin.fail:
+        msg: "Directory '{{ backup_directory }}' does not exist or is not a directory."
+      when: >-
+        not backup_directory_stat.stat.exists
+        or not backup_directory_stat.stat.isdir
+
+    - name: Verify exclusion file exists
+      ansible.builtin.stat:
+        path: "{{ exclude_file }}"
+      register: exclude_file_stat
+
+    - name: Fail when explicitly configured exclusion file does not exist
+      ansible.builtin.fail:
+        msg: "Restic exclusion file '{{ exclude_file }}' does not exist."
+      when: >-
+        restic_exclude_file is defined
+        and (
+          not (exclude_file_stat.stat.exists | default(false))
+          or not (exclude_file_stat.stat.isreg | default(false))
+        )
+
+    - name: Check Restic repository
+      ansible.builtin.command:
+        argv:
+          - "{{ restic_binary }}"
+          - >-
+            --option=s3.bucket-lookup={{
+              (s3_force_path_style | bool) | ternary('path', 'dns')
+            }}
+          - cat
+          - config
+      environment: "{{ restic_environment }}"
+      register: repository_check
+      changed_when: false
+      failed_when: false
+#      no_log: true
+
+    - name: Initialize Restic repository
+      ansible.builtin.command:
+        argv:
+          - "{{ restic_binary }}"
+          - >-
+            --option=s3.bucket-lookup={{
+              (s3_force_path_style | bool) | ternary('path', 'dns')
+            }}
+          - init
+      environment: "{{ restic_environment }}"
+      when: repository_check.rc != 0
+#      no_log: true
+
+    - name: Back up directory with Restic
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              restic_binary,
+              '--option=s3.bucket-lookup='
+                ~ ((s3_force_path_style | bool) | ternary('path', 'dns')),
+              'backup',
+              backup_directory,
+              '--with-atime',
+              '--tag',
+              backup_name
+            ]
+            + (
+                (exclude_file_stat.stat.isreg | default(false))
+                | ternary(['--exclude-file', exclude_file], [])
+              )
+          }}
+      environment: "{{ restic_environment }}"
+      register: restic_backup_result
+      retries: 3
+      delay: 10
+      until: restic_backup_result.rc == 0
+#      no_log: true
+
+    - name: Show success message
+      ansible.builtin.debug:
+        msg: >-
+          Restic snapshot '{{
+            (
+              restic_backup_result.stdout ~ '\n'
+              ~ restic_backup_result.stderr
+            )
+            | regex_findall('snapshot ([0-9a-f]+) saved')
+            | first
+            | default('unknown')
+          }}' for directory '{{ backup_directory }}' was saved incrementally to
+          s3://{{ s3_bucket }}/{{ s3_repository_path }}.
