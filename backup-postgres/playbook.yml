@@ -1,5 +1,5 @@
 - name: Stream pg_dump from PostgreSQL container to MinIO (compressed, timestamped file)
-  hosts: localhost
+  hosts: "{{ target_hosts | mandatory }}"
   gather_facts: yes
 
   vars:

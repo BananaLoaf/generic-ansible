@@ -8,6 +8,7 @@
     upload_latest_copy: "{{ upload_latest_copy | mandatory | bool | string | lower }}"
     upload_timestamped_copy: "{{ upload_timestamped_copy | mandatory | bool | string | lower }}"
     mirror_copy: "{{ mirror_copy | mandatory | bool | string | lower }}"
+    zip_threads: "on"
 
     s3_type: "{{ s3_type | mandatory }}"
     s3_provider: "{{ s3_provider | mandatory }}"
@@ -55,9 +56,19 @@
 
         source_parent="$(dirname {{ backup_directory | quote }})"
         source_name="$(basename {{ backup_directory | quote }})"
+
+        if command -v 7zz >/dev/null 2>&1; then
+          seven_zip=7zz
+        elif command -v 7z >/dev/null 2>&1; then
+          seven_zip=7z
+        else
+          echo "7-Zip executable (7zz or 7z) is required." >&2
+          exit 127
+        fi
+
         (
           cd "$source_parent"
-          zip -r -q "$archive_path" "$source_name"
+          "$seven_zip" a -tzip -mx=5 "-mmt={{ zip_threads }}" "$archive_path" "$source_name" >/dev/null
         )
 
         if [ "{{ upload_latest_copy }}" = "true" ]; then
