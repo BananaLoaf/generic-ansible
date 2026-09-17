@@ -1,0 +1,26 @@
+- name: Run an arbitrary command
+  hosts: "{{ target_hosts | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    command_to_run: "{{ command_to_run | mandatory }}"
+
+  tasks:
+    - name: Run command
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ command_to_run }}
+      args:
+        executable: /bin/bash
+      register: command_result
+
+    - name: Show command output
+      ansible.builtin.debug:
+        var: command_result.stdout_lines
+      when: command_result.stdout | length > 0
+
+    - name: Show command errors
+      ansible.builtin.debug:
+        var: command_result.stderr_lines
+      when: command_result.stderr | length > 0
